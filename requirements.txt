@@ -1,0 +1,8 @@
+ics
+requests
+python-dateutil
+pytz
+feedparser
+playwright
+extruct
+w3lib
