@@ -7,7 +7,7 @@ from playwright.sync_api import sync_playwright
 import extruct
 from w3lib.html import get_base_url
 
-AIRTABLE_WEBHOOK = "https://hooks.airtable.com/workflows/v1/genericWebhook/APP/WORKFLOW/WEBHOOK"  # <-- your URL
+AIRTABLE_WEBHOOK = "https://hooks.airtable.com/workflows/v1/genericWebhook/appWW141IxbsCrIU5/wflP0qLsiWCBPavt7/wtrmiPsRfJuFu8BYO"
 TZ = pytz.timezone("America/Denver")
 
 def now_iso():
