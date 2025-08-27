@@ -13,7 +13,7 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements.txt
       - run: python -m playwright install
-      - run: cat sources.csv              # 👈 this prints the CSV into the logs
+      - run: cat sources.csv
       - run: python ingest.py
         env:
           AIRTABLE_WEBHOOK: ${{ secrets.AIRTABLE_WEBHOOK }}
