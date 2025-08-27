@@ -1,0 +1,8 @@
+type,url,source_name,default_location
+page,https://helenamt.com/events/,Helena Tourism,Various
+page,https://www.helenaevents.com/,Helena Events,Various
+page,https://southwestmt.com/events/,Southwest Montana Tourism,Various
+page,https://www.visitthegulch.com/events,Visit the Gulch,Helena
+page,https://www.helenamt.gov/Community/Civic-Center/Civic-Center-Events,Helena Civic Center,Helena Civic Center
+page,https://themyrnaloy.com/whats-happening/events/,The Myrna Loy,The Myrna Loy
+ics,https://grandstreettheatre.com/calendar/?ical=1,Grandstreet Theatre,Grandstreet Theatre
