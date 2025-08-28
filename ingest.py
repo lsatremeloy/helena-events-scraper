@@ -1,17 +1,31 @@
 # pip install -r requirements.txt
 # requirements: ics requests python-dateutil pytz feedparser playwright extruct w3lib
 
-import os, csv, json, hashlib, datetime as dt, pytz, requests, feedparser, sys, re
+import os, csv, json, hashlib, datetime as dt, pytz, requests, feedparser, sys, re, time
 from dateutil import parser as dp
 from ics import Calendar
 from playwright.sync_api import sync_playwright
 import extruct
 from w3lib.html import get_base_url
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 # --- Config -------------------------------------------------------------------
 AIRTABLE_WEBHOOK = os.environ.get("AIRTABLE_WEBHOOK")  # set via GitHub Secret
 TZ = pytz.timezone("America/Denver")
+
+# Posting controls
+MAX_POSTS_PER_SOURCE = 60          # hard cap per source per run
+BASE_DELAY_SEC = 0.25              # 4 req/sec baseline to avoid 429s
+RETRY_BACKOFFS = [1.0, 2.0, 4.0]   # seconds to wait on 429/5xx, up to 3 retries
+
+# Titles to skip (case-insensitive, exact or contains)
+STOPWORD_TITLES = {
+    "details", "more info", "event calendar", "submit an event",
+    "submit event", "update your listing", "link to our website",
+    "events", "major sports and events"
+}
+# If title is very short *and* looks generic, skip it
+MIN_TITLE_LEN = 6
 
 # --- Utilities ----------------------------------------------------------------
 def now_iso():
@@ -34,12 +48,50 @@ def weekday_name(d):
 def sha1_id(*parts):
     return hashlib.sha1("||".join([p or "" for p in parts]).encode()).hexdigest()
 
+def is_event_like(title, href):
+    t = (title or "").strip()
+    if not t or len(t) < MIN_TITLE_LEN:
+        return False
+    lt = t.lower()
+    if lt in STOPWORD_TITLES:
+        return False
+    # Knock out obvious non-event navigation
+    if any(sw in lt for sw in ["details", "more info", "submit", "update", "calendar"]):
+        return False
+
+    # URL heuristics: allow if path contains these
+    try:
+        path = urlparse(href or "").path.lower()
+    except Exception:
+        path = ""
+    allow_fragments = ["/event", "/events", "/whats-happening", "/whatson", "/calendar", "/shows", "/performances"]
+    if any(seg in path for seg in allow_fragments):
+        return True
+
+    # Otherwise allow longer, specific-looking titles
+    return len(t) >= 15
+
+def safe_title(s):
+    return re.sub(r"\s+", " ", (s or "").strip())
+
 def post_event(data):
-    """POST one event to Airtable webhook using your generic schema."""
+    """POST one event to Airtable webhook with throttle + retries."""
     payload = {"data": data}
+    # baseline throttle
+    time.sleep(BASE_DELAY_SEC)
     try:
         r = requests.post(AIRTABLE_WEBHOOK, json=payload, timeout=30)
-        print(f"  → POST {data.get('event_name')!r} → {r.status_code}")
+        code = r.status_code
+        print(f"  → POST {data.get('event_name')!r} → {code}")
+        if code == 429 or code >= 500:
+            # exponential backoff retries
+            for wait in RETRY_BACKOFFS:
+                print(f"    …retrying in {wait:.1f}s")
+                time.sleep(wait)
+                r = requests.post(AIRTABLE_WEBHOOK, json=payload, timeout=30)
+                code = r.status_code
+                print(f"    → retry → {code}")
+                if code < 400: break
         r.raise_for_status()
     except Exception as e:
         print("  ! POST failed:", e)
@@ -110,35 +162,28 @@ def strip_tags(s):
 
 def fallback_cards_from_html(url, html):
     """
-    Very light heuristic:
-    - Split into blocks that likely represent event items (class/id contains 'event')
+    Heuristic:
+    - Split into blocks that likely represent event items (class/id contains 'event|listing|calendar')
     - Grab the first anchor as title/link
     - Sniff out a nearby month/day[/year] date string
     Returns list of dicts with keys ~ schema.org Event
     """
     items = []
-    # Split on common container tags to reduce false positives
     blocks = re.split(r'(?i)<(?:article|div|li)\b', html)
     for b in blocks:
         if not re.search(r'(?i)(event|events|listing|calendar)', b):
             continue
 
-        # Title + link
         m_link = re.search(r'(?is)<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', b)
         if not m_link:
             continue
         href = urljoin(url, m_link.group(1))
-        title = strip_tags(m_link.group(2))
-        if not title:
+        title = safe_title(strip_tags(m_link.group(2)))
+        if not title or not is_event_like(title, href):
             continue
 
-        # Try to find a date-looking string within the block
         m_date = DATE_RE.search(b)
-        date_text = None
-        if m_date:
-            # Join captured groups, e.g. "Sep 12 2025" or "September 1"
-            parts = [m_date.group(0)]
-            date_text = strip_tags(parts[0])
+        date_text = strip_tags(m_date.group(0)) if m_date else None
 
         items.append({
             "@type": "Event",
@@ -170,7 +215,7 @@ def ingest_ics(url, source_name, default_location=None):
         print("  ! Bad ICS content, skipping:", e)
         return
 
-    count = 0
+    posted = 0
     for e in cal.events:
         start = e.begin.datetime if e.begin else None
         data = {
@@ -190,8 +235,11 @@ def ingest_ics(url, source_name, default_location=None):
             "last_seen_at": now_iso(),
         }
         print("  · Posting event:", data["event_name"] or "(untitled)")
-        post_event(data); count += 1
-    print(f"ICS done: posted {count} events")
+        post_event(data); posted += 1
+        if posted >= MAX_POSTS_PER_SOURCE:
+            print(f"  · Reached MAX_POSTS_PER_SOURCE={MAX_POSTS_PER_SOURCE}, stopping")
+            break
+    print(f"ICS done: posted {posted} events")
 
 # --- Page (Playwright) --------------------------------------------------------
 def ingest_page(url, source_name, default_location=None):
@@ -218,11 +266,11 @@ def ingest_page(url, source_name, default_location=None):
                 print("  ! Giving up on page.")
                 return
 
-    # 1) Try structured data
+    # 1) Structured data
     evs = extract_structured_events(url, html) if html else []
     print(f"  · Found {len(evs)} structured event blocks")
 
-    # 2) Fallback to heuristic cards if nothing structured found
+    # 2) Fallback to cards if none
     used_fallback = False
     if not evs and html:
         print("  · No structured data; trying heuristic card scrape…")
@@ -230,18 +278,25 @@ def ingest_page(url, source_name, default_location=None):
         used_fallback = True
         print(f"  · Heuristic found {len(evs)} candidate cards")
 
+    # De-dupe by (title, link)
+    seen = set()
     posted = 0
     for ev in evs:
-        # Normalize fields regardless of source
+        title = safe_title(ev.get("name"))
+        link  = ev.get("url")
+        key = (title.lower(), (link or "").lower())
+        if title and key in seen:
+            continue
+        seen.add(key)
+
         start = ev.get("startDate")
         loc   = ev.get("location") if isinstance(ev.get("location"), dict) else {}
         addr  = loc.get("address") if isinstance(loc.get("address"), dict) else {}
 
-        # If fallback found a date string like "Sep 12 2025", we’ll try parsing it
         parsed_date = iso_date(start) if start else None
 
         data = {
-            "event_name": (ev.get("name") or "").strip(),
+            "event_name": title,
             "date": parsed_date,
             "day": weekday_name(parsed_date) if parsed_date else None,
             "time": iso_time(start) if start else None,
@@ -255,21 +310,24 @@ def ingest_page(url, source_name, default_location=None):
                 (addr.get("addressLocality") if isinstance(addr.get("addressLocality"), str) else None),
                 (addr.get("addressRegion") if isinstance(addr.get("addressRegion"), str) else None),
             ])).strip() or None,
-            "link": ev.get("url") or url,
+            "link": link or url,
             "status": "active",
             "source_id": (
                 ev.get("@id")
                 or ev.get("identifier")
-                or f"{'card' if used_fallback else 'jsonld'}:{sha1_id(url, (ev.get('name') or '').strip(), parsed_date or ev.get('url') or '')}"
+                or f"{'card' if used_fallback else 'jsonld'}:{sha1_id(url, title, parsed_date or link or '')}"
             ),
             "last_seen_at": now_iso(),
         }
 
-        if not data["event_name"]:
-            continue  # skip empty titles
+        if not data["event_name"] or not is_event_like(data["event_name"], data["link"]):
+            continue
 
         print("  · Posting event:", data["event_name"])
         post_event(data); posted += 1
+        if posted >= MAX_POSTS_PER_SOURCE:
+            print(f"  · Reached MAX_POSTS_PER_SOURCE={MAX_POSTS_PER_SOURCE}, stopping")
+            break
 
     print(f"PAGE done: posted {posted} events")
 
@@ -296,8 +354,13 @@ def ingest_rss(url, source_name, default_location=None):
             "source_id": f"rss:{sha1_id(url, entry.get('id') or entry.get('link') or entry.get('title'))}",
             "last_seen_at": now_iso(),
         }
+        if not is_event_like(data["event_name"], data["link"]):
+            continue
         print("  · Posting event:", data["event_name"] or "(untitled)")
         post_event(data); posted += 1
+        if posted >= MAX_POSTS_PER_SOURCE:
+            print(f"  · Reached MAX_POSTS_PER_SOURCE={MAX_POSTS_PER_SOURCE}, stopping")
+            break
     print(f"RSS done: posted {posted} events")
 
 # --- Runner -------------------------------------------------------------------
