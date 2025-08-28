@@ -101,6 +101,53 @@ def extract_structured_events(url, html):
 
     return all_events
 
+# --- Heuristic fallback: scan “event cards” for titles + links (+date) --------
+MONTH_WORD = r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+DATE_RE = re.compile(rf"(?i)\b{MONTH_WORD}\b[^<]{{0,40}}\b(\d{{1,2}})(?:[^<]{{0,40}}(\d{{4}}))?")
+
+def strip_tags(s):
+    return re.sub(r"<[^>]+>", "", s or "").strip()
+
+def fallback_cards_from_html(url, html):
+    """
+    Very light heuristic:
+    - Split into blocks that likely represent event items (class/id contains 'event')
+    - Grab the first anchor as title/link
+    - Sniff out a nearby month/day[/year] date string
+    Returns list of dicts with keys ~ schema.org Event
+    """
+    items = []
+    # Split on common container tags to reduce false positives
+    blocks = re.split(r'(?i)<(?:article|div|li)\b', html)
+    for b in blocks:
+        if not re.search(r'(?i)(event|events|listing|calendar)', b):
+            continue
+
+        # Title + link
+        m_link = re.search(r'(?is)<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', b)
+        if not m_link:
+            continue
+        href = urljoin(url, m_link.group(1))
+        title = strip_tags(m_link.group(2))
+        if not title:
+            continue
+
+        # Try to find a date-looking string within the block
+        m_date = DATE_RE.search(b)
+        date_text = None
+        if m_date:
+            # Join captured groups, e.g. "Sep 12 2025" or "September 1"
+            parts = [m_date.group(0)]
+            date_text = strip_tags(parts[0])
+
+        items.append({
+            "@type": "Event",
+            "name": title,
+            "url": href,
+            "startDate": date_text
+        })
+    return items
+
 # --- ICS ----------------------------------------------------------------------
 def ingest_ics(url, source_name, default_location=None):
     print(f"Fetching ICS: {url}")
@@ -171,19 +218,33 @@ def ingest_page(url, source_name, default_location=None):
                 print("  ! Giving up on page.")
                 return
 
+    # 1) Try structured data
     evs = extract_structured_events(url, html) if html else []
     print(f"  · Found {len(evs)} structured event blocks")
 
+    # 2) Fallback to heuristic cards if nothing structured found
+    used_fallback = False
+    if not evs and html:
+        print("  · No structured data; trying heuristic card scrape…")
+        evs = fallback_cards_from_html(url, html)
+        used_fallback = True
+        print(f"  · Heuristic found {len(evs)} candidate cards")
+
     posted = 0
     for ev in evs:
+        # Normalize fields regardless of source
         start = ev.get("startDate")
         loc   = ev.get("location") if isinstance(ev.get("location"), dict) else {}
         addr  = loc.get("address") if isinstance(loc.get("address"), dict) else {}
+
+        # If fallback found a date string like "Sep 12 2025", we’ll try parsing it
+        parsed_date = iso_date(start) if start else None
+
         data = {
             "event_name": (ev.get("name") or "").strip(),
-            "date": iso_date(start),
-            "day": weekday_name(start),
-            "time": iso_time(start),
+            "date": parsed_date,
+            "day": weekday_name(parsed_date) if parsed_date else None,
+            "time": iso_time(start) if start else None,
             "host_org": source_name,
             "description": (ev.get("description") or "").strip() or None,
             "cost": None,
@@ -196,10 +257,18 @@ def ingest_page(url, source_name, default_location=None):
             ])).strip() or None,
             "link": ev.get("url") or url,
             "status": "active",
-            "source_id": ev.get("@id") or ev.get("identifier") or f"jsonld:{sha1_id(url, (ev.get('name') or '').strip(), iso_date(start))}",
+            "source_id": (
+                ev.get("@id")
+                or ev.get("identifier")
+                or f"{'card' if used_fallback else 'jsonld'}:{sha1_id(url, (ev.get('name') or '').strip(), parsed_date or ev.get('url') or '')}"
+            ),
             "last_seen_at": now_iso(),
         }
-        print("  · Posting event:", data["event_name"] or "(untitled)")
+
+        if not data["event_name"]:
+            continue  # skip empty titles
+
+        print("  · Posting event:", data["event_name"])
         post_event(data); posted += 1
 
     print(f"PAGE done: posted {posted} events")
