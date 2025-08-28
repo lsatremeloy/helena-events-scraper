@@ -1,12 +1,13 @@
 # pip install -r requirements.txt
 # requirements: ics requests python-dateutil pytz feedparser playwright extruct w3lib
 
-import os, csv, json, hashlib, datetime as dt, pytz, requests, feedparser, sys
+import os, csv, json, hashlib, datetime as dt, pytz, requests, feedparser, sys, re
 from dateutil import parser as dp
 from ics import Calendar
 from playwright.sync_api import sync_playwright
 import extruct
 from w3lib.html import get_base_url
+from urllib.parse import urljoin
 
 # --- Config -------------------------------------------------------------------
 AIRTABLE_WEBHOOK = os.environ.get("AIRTABLE_WEBHOOK")  # set via GitHub Secret
@@ -42,6 +43,63 @@ def post_event(data):
         r.raise_for_status()
     except Exception as e:
         print("  ! POST failed:", e)
+
+# --- Extract schema.org Events from JSON-LD, Microdata, RDFa -------------------
+def extract_structured_events(url, html):
+    """Return schema.org Event dicts from JSON-LD, Microdata, and RDFa."""
+    all_events = []
+
+    data = extruct.extract(
+        html,
+        base_url=get_base_url(html, url),
+        syntaxes=['json-ld', 'microdata', 'rdfa']
+    )
+
+    # ---------- JSON-LD ----------
+    def as_list(x): return x if isinstance(x, list) else [x] if x else []
+    for block in (data.get('json-ld') or []):
+        types = as_list(block.get("@type"))
+        if "Event" in types:
+            all_events.append(block)
+        elif block.get("@type") == "ItemList":
+            for item in block.get("itemListElement", []) or []:
+                ent = item.get("item") or {}
+                if isinstance(ent, dict) and ("Event" in as_list(ent.get("@type"))):
+                    all_events.append(ent)
+
+    # ---------- Microdata ----------
+    for md in (data.get('microdata') or []):
+        types = md.get('type') or []
+        if any("schema.org/Event" in t for t in types):
+            props = md.get('properties') or {}
+            all_events.append({
+                "@type": "Event",
+                "name": props.get("name"),
+                "startDate": props.get("startDate"),
+                "location": props.get("location"),
+                "description": props.get("description"),
+                "url": props.get("url"),
+                "identifier": props.get("identifier"),
+                "@id": props.get("id") or props.get("@id"),
+            })
+
+    # ---------- RDFa ----------
+    for rd in (data.get('rdfa') or []):
+        types = rd.get('type') or []
+        if any("schema.org/Event" in t for t in types):
+            props = rd.get('properties') or {}
+            all_events.append({
+                "@type": "Event",
+                "name": props.get("name"),
+                "startDate": props.get("startDate"),
+                "location": props.get("location"),
+                "description": props.get("description"),
+                "url": props.get("url"),
+                "identifier": props.get("identifier"),
+                "@id": props.get("id") or props.get("@id"),
+            })
+
+    return all_events
 
 # --- ICS ----------------------------------------------------------------------
 def ingest_ics(url, source_name, default_location=None):
@@ -88,24 +146,6 @@ def ingest_ics(url, source_name, default_location=None):
         post_event(data); count += 1
     print(f"ICS done: posted {count} events")
 
-# --- JSON-LD extraction -------------------------------------------------------
-def extract_jsonld_events(url, html):
-    blocks = extruct.extract(html, base_url=get_base_url(html, url), syntaxes=['json-ld']).get('json-ld', [])
-    events = []
-
-    def as_list(x): return x if isinstance(x, list) else [x] if x is not None else []
-
-    for block in blocks:
-        types = as_list(block.get("@type"))
-        if "Event" in types:
-            events.append(block)
-        elif block.get("@type") == "ItemList":
-            for item in block.get("itemListElement", []):
-                ent = item.get("item") or {}
-                if isinstance(ent, dict) and (ent.get("@type") == "Event" or "Event" in as_list(ent.get("@type"))):
-                    events.append(ent)
-    return events
-
 # --- Page (Playwright) --------------------------------------------------------
 def ingest_page(url, source_name, default_location=None):
     print(f"Fetching PAGE: {url}")
@@ -131,8 +171,8 @@ def ingest_page(url, source_name, default_location=None):
                 print("  ! Giving up on page.")
                 return
 
-    evs = extract_jsonld_events(url, html) if html else []
-    print(f"  · Found {len(evs)} JSON-LD event blocks")
+    evs = extract_structured_events(url, html) if html else []
+    print(f"  · Found {len(evs)} structured event blocks")
 
     posted = 0
     for ev in evs:
@@ -148,11 +188,11 @@ def ingest_page(url, source_name, default_location=None):
             "description": (ev.get("description") or "").strip() or None,
             "cost": None,
             "tags": [],
-            "location": loc.get("name") or default_location,
+            "location": (loc.get("name") if isinstance(loc.get("name"), str) else None) or default_location,
             "address": ", ".join(filter(None, [
-                addr.get("streetAddress",""),
-                addr.get("addressLocality",""),
-                addr.get("addressRegion","")
+                (addr.get("streetAddress") if isinstance(addr.get("streetAddress"), str) else None),
+                (addr.get("addressLocality") if isinstance(addr.get("addressLocality"), str) else None),
+                (addr.get("addressRegion") if isinstance(addr.get("addressRegion"), str) else None),
             ])).strip() or None,
             "link": ev.get("url") or url,
             "status": "active",
